@@ -1,39 +1,42 @@
+#TODO: Implement currency normalization for Fenster
+from datetime import datetime, date, timedelta
+from pathlib import Path
 import logging
 import polars as pl
-from datetime import datetime, date, timedelta
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-
     processing_date = date.today().strftime("%Y_%m_%d")
-    apf_file = (
-        f"s3/bronze/apfel/subscriptions/apfel_subscriptions_{processing_date}.json"
+    bronze_apf_file = (
+        f"output_data/s3/bronze/apfel/subscriptions/apfel_subscriptions_{processing_date}.json"
     )
-    fenster_file = (
-        f"s3/bronze/fenster/subscriptions/fenster_subscriptions_{processing_date}.csv"
+    bronze_fenster_file = (
+        f"output_data/s3/bronze/fenster/subscriptions/fenster_subscriptions_{processing_date}.csv"
     )
+
+    silver_apfel_output_path = "output_data/s3/silver/apfel/subscriptions"
+    Path(silver_apfel_output_path).mkdir(parents=True, exist_ok=True)
+    silver_fenster_output_path = "output_data/s3/silver/fenster/subscriptions"
+    Path(silver_fenster_output_path).mkdir(parents=True, exist_ok=True)
+
     logging.info(f"Starting normalization process. Processing date {processing_date}.")
 
-    logging.info("Reading Apfel raw data...")
-    raw_df_apf = pl.read_json(apf_file, infer_schema_length=None)
+    logging.info("Reading Apfel raw data...")    
+    raw_df_apf = pl.read_json(bronze_apf_file, infer_schema_length=None)
     apf_normalized_df = normalize_apfel_events(raw_df_apf)
     apf_normalized_df.write_csv(
-        f"s3/silver/apfel/subscriptions/apfel_subscriptions_normalized_{processing_date}.csv"
+        f"{silver_apfel_output_path}/apfel_subscriptions_normalized_{processing_date}.csv"
     )
-    logging.info(
-        "Apfel data normalization finished, data persisted in the Silver Layer."
-    )
+    logging.info("Apfel data normalization finished, data persisted in the Silver Layer.")
 
     logging.info("Reading Fenster raw data...")
-    raw_df_fenster = pl.read_csv(fenster_file, null_values=["", "none"])
+    raw_df_fenster = pl.read_csv(bronze_fenster_file, null_values=["", "none"])
     normalized_fenster_df = normalize_fenster_events(raw_df_fenster)
     normalized_fenster_df.write_csv(
-        f"s3/silver/fenster/subscriptions/fenster_subscriptions_normalized_{processing_date}.csv"
+        f"{silver_fenster_output_path}/fenster_subscriptions_normalized_{processing_date}.csv"
     )
-    logging.info(
-        "Fenster data normalization finished, data persisted in the Silver Layer."
-    )
+    logging.info("Fenster data normalization finished, data persisted in the Silver Layer.")
 
 
 def normalize_apfel_events(raw_apf_df: pl.DataFrame) -> pl.DataFrame:
@@ -57,7 +60,6 @@ def normalize_apfel_events(raw_apf_df: pl.DataFrame) -> pl.DataFrame:
             pl.col("device_type").str.to_lowercase(),
             pl.col("customer_email").str.to_lowercase(),
         )
-        .filter(pl.col("processing_status") == "processed")
         .drop("count")
         .unique(subset="event_id")
     )
@@ -75,19 +77,14 @@ def normalize_fenster_events(raw_fenster_df: pl.DataFrame) -> pl.DataFrame:
             # Renamed / derived columns
             pl.col("id").alias("event_id"),
             pl.col("cid").alias("customer_uuid"),
-            pl.col("type")
-            .str.to_lowercase()
-            .replace(
+            pl.col("type").str.to_lowercase().replace(
                 {
                     "new": "SUBSCRIPTION_STARTED",
                     "renew": "SUBSCRIPTION_RENEWED",
                     "cancel": "SUBSCRIPTION_CANCELLED",
                 }
-            )
-            .alias("event_type"),
-            pl.col("ctry")
-            .str.to_uppercase()
-            .replace(
+            ).alias("event_type"),
+            pl.col("ctry").str.to_uppercase().replace(
                 {
                     "USA": "US",
                     "UNITED STATES": "US",
@@ -95,25 +92,20 @@ def normalize_fenster_events(raw_fenster_df: pl.DataFrame) -> pl.DataFrame:
                     "INVALID": None,
                     "XX": None,
                 }
-            )
-            .alias("country_code"),
+            ).alias("country_code"),
             pl.col("plan").str.extract(r"^([^_]+)", 1).alias("subscription_type"),
             pl.col("plan").str.extract(r"_([^_]+)$", 1).alias("renewal_period"),
             pl.col("mail").str.to_lowercase().alias("customer_email"),
             pl.col("ccy").str.to_uppercase().alias("currency"),
             pl.col("os").str.to_lowercase().alias("device_type"),
-            pl.struct(["ts", "tz"])
-            .map_elements(
+            pl.struct(["ts", "tz"]).map_elements(
                 lambda row: parse_ts_with_tz(row["ts"], row["tz"]),
                 return_dtype=pl.String,
-            )
-            .alias("event_timestamp"),
-            pl.struct(["signup_ts", "tz"])
-            .map_elements(
+            ).alias("event_timestamp"),
+            pl.struct(["signup_ts", "tz"]).map_elements(
                 lambda row: parse_ts_with_tz(row["signup_ts"], row["tz"]),
                 return_dtype=pl.String,
-            )
-            .alias("customer_created_at"),
+            ).alias("customer_created_at"),
             pl.col("state").alias("region"),
             pl.col("zip").alias("postal_code"),
             pl.col("price").alias("amount"),
@@ -130,8 +122,7 @@ def normalize_fenster_events(raw_fenster_df: pl.DataFrame) -> pl.DataFrame:
             "legacy_flag",
             "migrated_from",
             "batch_id",
-        )
-        .unique(subset="event_id")
+        ).unique(subset="event_id")
     )
     return normalized_fenster_df
 
