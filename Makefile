@@ -12,7 +12,7 @@ venv:
 requirements:
 	$(BIN)/pip install -r requirements.txt
 
-setup-api:
+setup-infra:
 	docker compose up --build
 
 extract-subscriptions:

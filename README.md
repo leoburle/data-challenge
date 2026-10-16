@@ -1,86 +1,54 @@
-# Data Engineering — Technical Assignment
+## Script structure:
+The pipeline follows a medallion layout (bronze, silver, gold). Each stage has a script in `data_pipeline/`.
 
-The goal of this assignment is:
-- **For you:** To see what type of issues you will be expected to work on at Helu.
-- **For us:** To see how you think and approach tasks.
+### Bronze layer:
+- Script: extract_subscriptions.py
+- What it does: 
+    - Pulls data from the endpoints
+    - Saves each raw file unchanged, suffixed with the extraction date. 
+- Where is the data loaded: The files are saved on output_data/s3/bronze created at runtime
 
-## Problem Statement
 
-A SaaS company sells its app on two different platforms. The CFO needs a financial report that tracks metrics for both platforms (including acquisitions, renewals, and MRR), for each country per month. Currently, the CFO has to analyse the financial reports on each platform separately, which is too time-consuming!
+### Silver layer:
+- Script: data_normalization.py
+- What it does: 
+    - Reads the daily batch from the bronze layer
+    - Defines a common schema for Apfel and Fenster
+    - Standardize column values
+    - File standardization
+    - Currency conversion to EUR
+    - Timestamp conversion to UTC.
+- Where is the data loaded: The csv files are saved on output_data/s3/silver created at runtime
 
-The Data Engineering team is tasked with ingesting subscription events from each platform and outputting a consolidated report. The Analytics team will then build a visualisation for the CFO on top of it.
 
-> **MRR Definition:** The total monthly revenue expected from active subscriptions at the end of each reporting period. Cancelled subscriptions should not contribute to MRR.
+### Gold layer:
+- Script: load_dw_gold_layer.py
+- What it does:
+  - Reads all existing Silver Layer Apfel and Fenster files.
+  - Unions both platforms and deduplicates on `event_id`.
+  - Builds the fact table, one row per event.
+  - Builds `dim_customer`, one row per customer and platform, with the latest known attributes.
+  - Builds `monthly_metrics` report (MRR, renewals, cancellations, acquisitions by month, country, platform and subscription type). MRR is computed from each customer's last event, carried forward until a cancellation.
+- Where is the data loaded: Into a clickhouse docker instance
 
----
 
-## Requirements
+## How to run the pipeline:
+- Run `make local-setup`: to create a venv and install all necessary packages
+- Run `make setup-infra` to start the API and clickhouse instances
+- Run `make run-pipeline` to run all data pipeline scripts in correct order
 
-- Your pipeline should evaluate and fix any data quality issues you identify.
-- The consolidated report must include at least the following attributes: `platform`, `subscription_type`, `country`, `acquisitions`, `renewals`, `cancellations`, `mrr_eur`.
-- Subscription events and exchange rates should be ingested from the Docker-based API (see [Data Sources](#data-sources) below).
-- The report should be stored in a **queryable format** (please document reasons for your storage decision).
-- The pipeline should be **idempotent**.
+## How to query the report:
+Use the Jupyter Notebook to connect to the Clickhouse instance, the report is the monthly_metrics table. A sample query was provided.
 
----
+## Notes about design:
 
-## Data Sources
+- Technical Stack: I tried to use the same technologies (polars for data processing and clickhouse as a data warehouse) mentioned on the interview so my experience doing the challenge would be as close as possible to a real Helu project.
 
-### Starting the Subscription API
+Regarding data modeling:
 
-Run the following command from the project root to build and start the data API:
+I did not see the need of creating a very normalized model, so I ended opting for a star schema. 
 
-```bash
-docker compose up --build
-```
+Apart from the report table there is:
 
-Verify it's running:
-```bash
-curl http://localhost:5050/health
-```
-
-Once running, the following endpoints are available at `http://localhost:5050`:
-
-| Endpoint | Format | Description |
-|----------|--------|-------------|
-| `/apfel/subscriptions` | JSON | Apfel platform subscription events |
-| `/fenster/subscriptions` | CSV | Fenster platform subscription events |
-| `/exchange-rates` | CSV | Exchange rates |
-| `/health` | JSON | Health check |
-
-> **Note:** There is no provided schema documentation for these endpoints. Data exploration is part of the exercise.
-
-> If you have problems running or setting up Docker, you can use the CSV source files in the `data/` directory directly instead.
-
----
-
-## Deliverables
-
-1. **An executable Python (3.10+) solution** that meets all the above requirements.
-2. **A schema for the report** should be defined — consider what would make the report meaningful and useful for the CFO.
-3. **A README file** that explains:
-   - How to run the solution (and any setup required)
-   - How to query the report
-   - Design decisions you made along the way
-
-Please fork this repository and submit your solution as a link to your fork. You are free to use any libraries you prefer.
-
-### Stretch Goals
-
-These are optional — only if you have time and want to go further:
-
-- Add validation or quality checks on the final report
-- Write meaningful tests
-
----
-
-## Guidelines
-
-- Think of this assessment as a real project at Helu.
-- Ensure your code is of **high quality** and follows best design practices. However, there is no need to implement a production-ready, infinitely scalable solution (running the solution locally is sufficient).
-- **Quality over completeness.** We would rather see a well-thought-out partial solution than a complete one you can't fully explain. If you run out of time, document your thinking and next steps in the README.
-- **Time expectation:** The solution should take around **3 hours**. If it takes longer for any reason, or you don't have enough time for all deliverables, that's no problem! Focus on doing good work on the parts you do complete.
-- The problem is intentionally vaguely defined (e.g. what storage to use) — we're interested in how you approach problems and make decisions with limited information.
-- **We evaluate understanding over output.** You should be able to explain every part of your code and design choices in a follow-up interview.
-
-Good luck and have fun!
+- fact_subscription_events: holds one row per event, with measures such as revenue_eur and tax_eur.
+- dim_customer:  a single denormalized dimension, keyed by (customer_uuid, platform), example of fields available: customer_email, language, last_event_type. Although this table was not used to create the report, I believe it makes sense to have a table with latest client information.

@@ -1,4 +1,3 @@
-#TODO: Implement currency normalization for Fenster
 from datetime import datetime, date, timedelta
 from pathlib import Path
 import logging
@@ -14,6 +13,9 @@ def main():
     bronze_fenster_file = (
         f"output_data/s3/bronze/fenster/subscriptions/fenster_subscriptions_{processing_date}.csv"
     )
+    exchange_rates_file = (
+        f"output_data/s3/bronze/exchange-rates/exchange_rates_{processing_date}.csv"
+    )
 
     silver_apfel_output_path = "output_data/s3/silver/apfel/subscriptions"
     Path(silver_apfel_output_path).mkdir(parents=True, exist_ok=True)
@@ -22,9 +24,13 @@ def main():
 
     logging.info(f"Starting normalization process. Processing date {processing_date}.")
 
+    exchange_rates_df = pl.read_csv(exchange_rates_file)
+
     logging.info("Reading Apfel raw data...")    
     raw_df_apf = pl.read_json(bronze_apf_file, infer_schema_length=None)
     apf_normalized_df = normalize_apfel_events(raw_df_apf)
+    apf_normalized_df = add_converted_currency_column(apf_normalized_df, exchange_rates_df)
+
     apf_normalized_df.write_csv(
         f"{silver_apfel_output_path}/apfel_subscriptions_normalized_{processing_date}.csv"
     )
@@ -33,6 +39,9 @@ def main():
     logging.info("Reading Fenster raw data...")
     raw_df_fenster = pl.read_csv(bronze_fenster_file, null_values=["", "none"])
     normalized_fenster_df = normalize_fenster_events(raw_df_fenster)
+
+    normalized_fenster_df = add_converted_currency_column(normalized_fenster_df, exchange_rates_df)
+
     normalized_fenster_df.write_csv(
         f"{silver_fenster_output_path}/fenster_subscriptions_normalized_{processing_date}.csv"
     )
@@ -59,8 +68,9 @@ def normalize_apfel_events(raw_apf_df: pl.DataFrame) -> pl.DataFrame:
             pl.col("renewal_period").str.to_lowercase(),
             pl.col("device_type").str.to_lowercase(),
             pl.col("customer_email").str.to_lowercase(),
+            pl.col("amount").alias("revenue"),
         )
-        .drop("count")
+        .drop("count").drop("amount")
         .unique(subset="event_id")
     )
     return events_normalized_df
@@ -108,7 +118,7 @@ def normalize_fenster_events(raw_fenster_df: pl.DataFrame) -> pl.DataFrame:
             ).alias("customer_created_at"),
             pl.col("state").alias("region"),
             pl.col("zip").alias("postal_code"),
-            pl.col("price").alias("amount"),
+            pl.col("price").alias("revenue"),
             pl.col("tax").alias("tax_amount"),
             pl.col("row_hash").alias("internal_ref"),
             pl.col("lang").alias("language"),
@@ -154,6 +164,52 @@ def parse_ts_with_tz(ts: str | None, tz_name: str | None) -> str | None:
         return None
 
     return (local_dt - timedelta(hours=offset)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+def add_converted_currency_column(df, exchange_rates_df):
+    """
+    Convert the revenue and tax column in the dataframe to EUR using the provided exchange rates.
+    """
+
+    df = df.with_columns(
+        pl.col("event_timestamp").str.slice(0, 10).alias("date")
+    )
+
+    # Single float used as fallback rate
+    avg_rate_to_eur = exchange_rates_df["rate_to_eur"].mean()
+
+    df = df.join(
+        exchange_rates_df,
+        on=["currency", "date"],
+        how="left"
+    )
+
+    is_eur = pl.col("currency") == "EUR"
+
+    df = df.with_columns(
+        # Convert revenue and tax to EUR based on the exchange rate
+        # If the currency is EUR, keep the original value; 
+        #  otherwise, convert using the rate or fallback to the average rate
+        pl.when(is_eur)
+        .then(pl.col("revenue"))
+        .when(~is_eur & pl.col("rate_to_eur").is_not_null())
+        .then(pl.col("revenue").cast(pl.Decimal(18, 2)) * pl.col("rate_to_eur"))
+        .otherwise(pl.col("revenue").cast(pl.Decimal(18, 2)) * float(avg_rate_to_eur))
+        .alias("revenue_eur"),
+
+        pl.when(is_eur)
+        .then(pl.col("tax_amount"))
+        .when(~is_eur & pl.col("rate_to_eur").is_not_null())
+        .then(pl.col("tax_amount").cast(pl.Decimal(18, 2)) * pl.col("rate_to_eur"))
+        .otherwise(pl.col("tax_amount").cast(pl.Decimal(18, 2)) * float(avg_rate_to_eur))
+        .alias("tax_eur"),
+    ).drop("rate_to_eur")
+
+    df = df.with_columns(
+        pl.col("revenue_eur").cast(pl.Decimal(18, 2)).alias("revenue_eur"),
+        pl.col("tax_eur").cast(pl.Decimal(18, 2)).alias("tax_eur"),
+    ).drop("date")
+
+    return df
 
 
 if __name__ == "__main__":
